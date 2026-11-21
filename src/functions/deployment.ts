@@ -7,7 +7,7 @@ import { sendSimulationPush } from './push';
 const SERIAL = /^[A-Za-z0-9._-]{1,100}$/;
 const ID = /^[A-Za-z0-9._:-]{1,100}$/;
 const GO = /^[A-Za-z0-9._:-]{1,80}$/;
-const TABLES = {devices:'SentinelDevices', deployments:'SentinelDeployments', events:'SentinelDeviceEvents'};
+const TABLES = {devices:'SentinelDevices', deployments:'SentinelDeployments', events:'SentinelDeviceEvents', commands:'SentinelDeviceCommands'};
 const sha = (s:string) => createHash('sha256').update(s).digest('hex');
 const storage = () => { const connection = process.env.SENTINEL_STORAGE_CONNECTION; if (!connection) throw new Error('Storage not configured'); return connection; };
 const table = (c:string,n:string) => TableClient.fromConnectionString(c,n);
@@ -26,6 +26,50 @@ type Deployment = { customerId:string; serialNumber:string; status:string; farmI
   latitude?:number;longitude?:number; goId?:string; requestedAt?:string; confirmedAt?:string; configuredAt?:string; ackCommandAlertId?:string;
   configVersion?:number; configJson?:string; currentAlertId?:string; ackCommandId?:string; ackPhone?:string; ackAt?:string; };
 type DeviceEvent = {eventId:string;type:string;at?:string; relatedEventId?:string;recipient?:string;modemResult?:string;sender?:string;commandId?:string};
+
+type PowerCommand = {partitionKey:string;rowKey:string;customerId:string;type:string;status:string;
+  requestedAt:string;expiresAt:string;deliveredAt?:string;appliedAt?:string;confirmedAt?:string};
+
+// Commands are queued by the portal and delivered during authenticated device check-in.
+async function pendingPowerCommands(connection:string, serial:string, customerId:string) {
+  const commands=table(connection,TABLES.commands);
+  try {
+    const result:{commandId:string;type:string}[]=[];
+    for await(const cmd of commands.listEntities<PowerCommand>({queryOptions:{filter:`PartitionKey eq '${serial}'`}})) {
+      if(cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))continue;
+      if(cmd.status!=='Queued' && cmd.status!=='Delivered')continue;
+      if(Date.parse(cmd.expiresAt)<=Date.now()) {
+        try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Expired'},'Merge',{etag:cmd.etag});}
+        catch(e){if(errorStatus(e)!==412 && errorStatus(e)!==404)throw e;}
+        continue;
+      }
+      if(cmd.status==='Queued') {
+        try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Delivered',deliveredAt:now()},'Merge',{etag:cmd.etag});}
+        catch(e){if(errorStatus(e)===412 || errorStatus(e)===404)continue;throw e;}
+      }
+      result.push({commandId:cmd.rowKey,type:cmd.type});
+    }
+    return result;
+  }catch(e){if(errorStatus(e)===404)return [];throw e;}
+}
+
+async function applyPowerCommandEvent(connection:string, serial:string, customerId:string, ev:DeviceEvent) {
+  if(!ev.commandId || (ev.type!=='COMMAND_APPLIED' && ev.type!=='BOOT'))return;
+  const commands=table(connection,TABLES.commands);
+  let cmd:PowerCommand & {etag?:string};
+  try {cmd=await commands.getEntity<PowerCommand>(serial,ev.commandId);}
+  catch(e){if(errorStatus(e)===404)return;throw e;}
+  if(cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))return;
+  if(ev.type==='COMMAND_APPLIED' && cmd.status==='Delivered') {
+    try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Applied',appliedAt:now()},'Merge',{etag:cmd.etag});}
+    catch(e){if(errorStatus(e)!==412)throw e;}
+  }
+  if(ev.type==='BOOT' && cmd.type==='DEVICE_RESTART' && (cmd.status==='Applied' || cmd.status==='Delivered')) {
+    try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Confirmed',confirmedAt:now()},'Merge',{etag:cmd.etag});}
+    catch(e){if(errorStatus(e)!==412)throw e;}
+  }
+}
+
 function inside([lat,lng]:Coordinate,polygon:Coordinate[]) {
   let result=false;
   for(let i=0,j=polygon.length-1;i<polygon.length;j=i++) {
@@ -152,6 +196,7 @@ async function deviceCheckin(request:HttpRequest,context:InvocationContext):Prom
           commandId:ev.commandId??'',modemResult:ev.modemResult??'',receivedAt:now()});
       } catch(e) {if(errorStatus(e)!==409)throw e;newlyStored=false;}
       acknowledged.push(ev.eventId); // only after persisted or confirmed duplicate
+      await applyPowerCommandEvent(c,serial,device.customerId,ev);
       if(deployment && newlyStored && (ev.type==='WATER_DETECTED'||ev.type==='WATER_CLEARED') && deployment.configJson) {
         try { const config=JSON.parse(deployment.configJson) as Config;
           if(config.pushEnabled) await sendSimulationPush(c,device.customerId,`${device.displayName} · Sentinel`,
@@ -198,13 +243,13 @@ async function deviceCheckin(request:HttpRequest,context:InvocationContext):Prom
       ...(body.wet!==undefined?{lastWaterState:body.wet as boolean}:{}),updatedAt:now()},'Merge');
     let config: Config|null=null;
     if(deployment?.configJson && ['Configured','Active'].includes(deployment.status))config=JSON.parse(deployment.configJson) as Config;
+    const powerCommands=await pendingPowerCommands(c,serial,device.customerId);
     return {status:200,headers:{'Cache-Control':'no-store'},jsonBody:{serverTime:now(),
       acknowledgedEventIds:acknowledged,
       deployment:deployment?{id:deployment.rowKey,status:deployment.status,farmName:deployment.farmName??null,bayName:deployment.bayName??null,
         waitingForConfirmation:deployment.status==='Pending',timeoutSeconds:600}:null,
       configuration:config,
-      commands:deployment?.ackCommandId&&deployment.ackCommandAlertId?[{commandId:deployment.ackCommandId,
-        type:'STOP_SMS_REMINDERS',alertId:deployment.ackCommandAlertId}]:[],
+      commands:powerCommands,
       nextReportSeconds:deployment?.status==='Pending'?30:900}};
   } catch(e){context.error('Device check-in error',e);return fail(500,'Device check-in failed');}
 }
