@@ -1,0 +1,175 @@
+
+import { app, HttpRequest, HttpResponseInit, InvocationContext } from "@azure/functions";
+import { TableClient } from "@azure/data-tables";
+import { randomUUID } from "node:crypto";
+
+interface DeviceReport {
+  deviceId: string;
+  latitude: number;
+  longitude: number;
+  wet: boolean;
+  battery: number;
+  timestamp?: string;
+}
+
+export async function reports(
+  request: HttpRequest,
+  context: InvocationContext
+): Promise<HttpResponseInit> {
+  try {
+    const body = await request.json() as Partial<DeviceReport>;
+
+    if (
+      typeof body.deviceId !== "string" ||
+      !body.deviceId.trim() ||
+      typeof body.latitude !== "number" ||
+      !Number.isFinite(body.latitude) ||
+      body.latitude < -90 || body.latitude > 90 ||
+      typeof body.longitude !== "number" ||
+      !Number.isFinite(body.longitude) ||
+      body.longitude < -180 || body.longitude > 180 ||
+      typeof body.wet !== "boolean" ||
+      typeof body.battery !== "number" ||
+      !Number.isFinite(body.battery) ||
+      body.battery < 0 || body.battery > 100
+    ) {
+      return {
+        status: 400,
+        jsonBody: { error: "Invalid device report" }
+      };
+    }
+
+    const connection = process.env.SENTINEL_STORAGE_CONNECTION;
+
+    if (!connection) {
+      context.error("Storage connection is not configured");
+      return {
+        status: 500,
+        jsonBody: { error: "Storage is not configured" }
+      };
+    }
+
+    const table = TableClient.fromConnectionString(
+      connection,
+      "SentinelReports"
+    );
+
+    const receivedAt = new Date().toISOString();
+
+    const entity = {
+      partitionKey: body.deviceId.trim(),
+      rowKey: `${receivedAt}_${randomUUID()}`,
+      latitude: body.latitude,
+      longitude: body.longitude,
+      wet: body.wet,
+      battery: body.battery,
+      receivedAt
+    };
+
+    await table.createEntity(entity);
+
+    context.log(`Stored report from ${entity.partitionKey}`);
+
+    return {
+      status: 201,
+      jsonBody: {
+        success: true,
+        reportId: entity.rowKey,
+        receivedAt
+      }
+    };
+  } catch (error) {
+    context.error("Failed to process report", error);
+
+    return {
+      status: 500,
+      jsonBody: { error: "Unable to save report" }
+    };
+  }
+}
+
+
+async function getReports(
+  request: HttpRequest,
+  context: InvocationContext
+): Promise<HttpResponseInit> {
+  try {
+    const connection = process.env.SENTINEL_STORAGE_CONNECTION;
+
+    if (!connection) {
+      context.error("Storage connection is not configured");
+      return {
+        status: 500,
+        jsonBody: { error: "Storage is not configured" }
+      };
+    }
+
+    const deviceId = request.query.get("deviceId")?.trim();
+
+    if (!deviceId || deviceId.length > 128) {
+      return {
+        status: 400,
+        jsonBody: { error: "A valid deviceId is required" }
+      };
+    }
+
+    const table = TableClient.fromConnectionString(
+      connection,
+      "SentinelReports"
+    );
+
+    const reports = [];
+
+    for await (const entity of table.listEntities({
+      queryOptions: {
+        filter: `PartitionKey eq '${deviceId.replace(/'/g, "''")}'`
+      }
+    })) {
+      reports.push({
+        deviceId: entity.partitionKey,
+        latitude: entity.latitude,
+        longitude: entity.longitude,
+        wet: entity.wet,
+        battery: entity.battery,
+        receivedAt: entity.receivedAt
+      });
+
+      if (reports.length >= 100) break;
+    }
+
+    reports.sort((a, b) =>
+      String(b.receivedAt).localeCompare(String(a.receivedAt))
+    );
+
+    return {
+      status: 200,
+      jsonBody: {
+        deviceId,
+        count: reports.length,
+        reports
+      }
+    };
+  } catch (error) {
+    context.error("Failed to retrieve reports", error);
+
+    return {
+      status: 500,
+      jsonBody: { error: "Unable to retrieve reports" }
+    };
+  }
+}
+
+app.http("reportsGet", {
+  methods: ["GET"],
+  authLevel: "function",
+  route: "reports",
+  handler: getReports
+});
+
+app.http("reports", {
+  methods: ["POST"],
+  authLevel: "function",
+  route: "reports",
+  handler: reports
+});
+
