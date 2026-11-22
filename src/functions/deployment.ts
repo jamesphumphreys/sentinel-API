@@ -18,7 +18,8 @@ type Coordinate = [number,number];
 type Device = { deviceId:string; status:string; deviceType:string; displayName:string; customerId:string; deviceKeyHash?:string;
   locationMode?:string; manualLatitude?:number; manualLongitude?:number; currentDeploymentId?:string; lastGoId?:string;
   deploymentState?:string; lastSeenAt?:string; batteryPercent?:number; lastWaterState?:boolean;
-  activeLatitude?:number; activeLongitude?:number; activeFarmId?:string; activeBayId?:string; };
+  activeLatitude?:number; activeLongitude?:number; activeFarmId?:string; activeBayId?:string;
+  desiredPowerState?:string; telemetryIntervalSeconds?:number; powerOffCheckIntervalSeconds?:number; };
 type Config = { deploymentId:string; version:number; farmId:string; farmName:string; bayId:string; bayName:string;
   pushEnabled:boolean; smsEnabled:boolean; smsRepeatMinutes:number; smsMaxReminders:number;
   smsRecipients:{userId:string; phoneNumber:string}[]; };
@@ -250,7 +251,13 @@ async function deviceCheckin(request:HttpRequest,context:InvocationContext):Prom
         waitingForConfirmation:deployment.status==='Pending',timeoutSeconds:600}:null,
       configuration:config,
       commands:powerCommands,
-      nextReportSeconds:deployment?.status==='Pending'?30:900}};
+      powerSettings: {
+        desiredPowerState: device.desiredPowerState === 'OFF' ? 'OFF' : 'ON',
+        telemetryIntervalSeconds: typeof device.telemetryIntervalSeconds === 'number' ? device.telemetryIntervalSeconds : 30,
+        powerOffCheckIntervalSeconds: typeof device.powerOffCheckIntervalSeconds === 'number' ? device.powerOffCheckIntervalSeconds : 300,
+        configurationPollIntervalSeconds: 30
+      },
+      nextReportSeconds: typeof device.telemetryIntervalSeconds === 'number' ? device.telemetryIntervalSeconds : 30}};
   } catch(e){context.error('Device check-in error',e);return fail(500,'Device check-in failed');}
 }
 

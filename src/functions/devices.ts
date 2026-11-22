@@ -19,6 +19,7 @@ type Device = {
   deviceKeyHash?: string; currentDeploymentId?: string; lastGoId?: string; lastSeenAt?: string;
   activeFarmId?: string; activeBayId?: string; batteryPercent?: number; lastWaterState?: boolean;
   imei?: string; simIccid?: string; simCarrier?: string; simPhoneNumber?: string; modemModel?: string; firmwareVersion?: string;
+  desiredPowerState?: string; telemetryIntervalSeconds?: number; powerOffCheckIntervalSeconds?: number;
   createdAt: string; updatedAt: string;
 };
 type Body = { serialNumber?: unknown; deviceType?: unknown; displayName?: unknown;
@@ -42,6 +43,7 @@ function present(entity: Device & { etag?: string }) {
     activeLatitude: typeof entity.activeLatitude === 'number' ? entity.activeLatitude : null,
     activeLongitude: typeof entity.activeLongitude === 'number' ? entity.activeLongitude : null,
     ...Object.fromEntries(HARDWARE_FIELDS.map(field => [field, entity[field] || null])),
+    powerSettings: {desiredPowerState: entity.desiredPowerState === "OFF" ? "OFF" : "ON", telemetryIntervalSeconds: entity.telemetryIntervalSeconds ?? 30, powerOffCheckIntervalSeconds: entity.powerOffCheckIntervalSeconds ?? 300},
     createdAt: entity.createdAt, updatedAt: entity.updatedAt, etag: entity.etag
   };
 }
@@ -177,6 +179,9 @@ async function updateDevice(request: HttpRequest, context: InvocationContext): P
       deploymentState: existing.customerId === customerId ? (existing.deploymentState || 'Awaiting') : 'Awaiting',
       ...(existing.customerId === customerId ? {
         ...(existing.deviceKeyHash ? {deviceKeyHash:existing.deviceKeyHash}:{}),
+        ...(existing.desiredPowerState ? {desiredPowerState:existing.desiredPowerState}:{}),
+        ...(typeof existing.telemetryIntervalSeconds === "number" ? {telemetryIntervalSeconds:existing.telemetryIntervalSeconds}:{}),
+        ...(typeof existing.powerOffCheckIntervalSeconds === "number" ? {powerOffCheckIntervalSeconds:existing.powerOffCheckIntervalSeconds}:{}),
         ...(existing.currentDeploymentId ? {currentDeploymentId:existing.currentDeploymentId}:{}),
         ...(existing.lastGoId ? {lastGoId:existing.lastGoId}:{}),
         ...(existing.lastSeenAt ? {lastSeenAt:existing.lastSeenAt}:{}),
