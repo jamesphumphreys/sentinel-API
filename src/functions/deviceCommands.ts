@@ -257,6 +257,51 @@ async function createLegacyCommand(
   );
 }
 
+// Persist timeouts using optimistic concurrency so a concurrent device
+// acknowledgement cannot be overwritten by a stale history read.
+async function settleExpiredCommand(
+  commands: TableClient,
+  serial: string,
+  commandId: string
+): Promise<CommandEntity> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const current = await commands.getEntity<CommandEntity>(serial, commandId);
+    const now = Date.now();
+    const expires = Date.parse(current.expiresAt);
+    if (current.protocolVersion !== 1 || !Number.isFinite(expires) || expires > now) {
+      return current;
+    }
+
+    const at = new Date(now).toISOString();
+    let patch: Partial<CommandEntity>;
+    switch (current.status) {
+      case 'Queued':
+        patch = { status: 'Expired', expiredAt: at };
+        break;
+      case 'Delivered':
+        patch = { status: 'Failed', failedAt: at, failureReason: 'Device acknowledgement timeout; execution unconfirmed' };
+        break;
+      case 'Accepted':
+        patch = { status: 'Failed', failedAt: at, failureReason: 'Device execution timeout; outcome unconfirmed' };
+        break;
+      case 'Applied':
+        patch = { status: 'Failed', failedAt: at, failureReason: 'Device confirmation timeout; outcome unconfirmed' };
+        break;
+      default:
+        return current;
+    }
+
+    if (!current.etag) throw new Error('Command ETag unavailable');
+    try {
+      await commands.updateEntity({ partitionKey: serial, rowKey: commandId, ...patch }, 'Merge', { etag: current.etag });
+      return { ...current, ...patch };
+    } catch (error) {
+      if (errorStatus(error) !== 412) throw error;
+    }
+  }
+  throw new Error('Command changed repeatedly during timeout processing');
+}
+
 async function createProtocolCommand(
   access: Access,
   serial: string,
@@ -492,14 +537,12 @@ async function createProtocolCommand(
       continue;
     }
 
+    const current = await settleExpiredCommand(commands, serial, existing.rowKey);
     const pending =
-      (
-        existing.status === 'Queued' &&
-        Date.parse(existing.expiresAt) > Date.now()
-      ) ||
-      existing.status === 'Delivered' ||
-      existing.status === 'Accepted' ||
-      existing.status === 'Applied';
+      current.status === 'Queued' ||
+      current.status === 'Delivered' ||
+      current.status === 'Accepted' ||
+      current.status === 'Applied';
 
     if (pending) {
       return fail(
@@ -673,10 +716,9 @@ async function listCommands(
 
     try {
 
+      const commands = tableFor(access.connection);
       for await (
-        const entity of tableFor(
-          access.connection
-        ).listEntities<CommandEntity>({
+        const entity of commands.listEntities<CommandEntity>({
           queryOptions: {
             filter: `PartitionKey eq '${serial}'`
           }
@@ -721,7 +763,7 @@ async function listCommands(
         }
 
         results.push(
-          presentCommand(entity)
+          presentCommand(await settleExpiredCommand(commands, serial, entity.rowKey))
         );
       }
 
