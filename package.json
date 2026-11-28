@@ -1,7 +1,7 @@
 {
-  "name": "",
+  "name": "sentinel-api",
   "version": "1.0.0",
-  "description": "",
+  "description": "Sentinel platform backend API",
   "main": "dist/src/functions/*.js",
   "scripts": {
     "build": "tsc",
@@ -9,7 +9,7 @@
     "clean": "rimraf dist",
     "prestart": "npm run clean && npm run build",
     "start": "func start",
-    "test": "echo \"No tests yet...\""
+    "test": "npm run build && node --test tests/*.test.cjs"
   },
   "dependencies": {
     "@azure/data-tables": "^13.3.2",
@@ -23,5 +23,6 @@
     "@types/web-push": "^3.6.4",
     "rimraf": "^5.0.0",
     "typescript": "^5.0.0"
-  }
+  },
+  "private": true
 }
