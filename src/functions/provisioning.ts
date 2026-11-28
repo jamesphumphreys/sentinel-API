@@ -154,7 +154,7 @@ async function issueCredential(serial:string,e:Identity & {etag?:string},t:Table
     await d.updateEntity({partitionKey:PK,rowKey:serial,deviceKeyHash,updatedAt:now},'Merge',{etag:existing.etag});
   } else {
     if(e.recoveryAuthorizedAt) return fail(409,'Registry identity unavailable');
-    await d.createEntity({partitionKey:PK,rowKey:serial,deviceId:e.deviceId,serialNumber:serial,deviceType:manifest.deviceType,manifestJson:e.manifestJson,fingerprint:e.fingerprint,isSimulated:e.isSimulated===true,provisioningStatus:'Approved',allocationStatus:'Inventory',deploymentStatus:'Undeployed',lifecycleStatus:'Active',displayName:e.displayName,status:'Inventory',customerId:'',locationMode:'GPS',deploymentState:'Awaiting',firmwareVersion:e.firmwareVersion,deviceKeyHash,createdAt:now,updatedAt:now});
+    await d.createEntity({partitionKey:PK,rowKey:serial,deviceId:e.deviceId,serialNumber:serial,deviceType:manifest.deviceType,manifestJson:e.manifestJson,fingerprint:e.fingerprint,isSimulated:e.isSimulated===true,provisioningStatus:'Approved',allocationStatus:'Inventory',deploymentStatus:'Undeployed',deploymentRevision: 0,lifecycleStatus:'Active',displayName:e.displayName,status:'Inventory',customerId:'',locationMode:'GPS',deploymentState:'Awaiting',firmwareVersion:e.firmwareVersion,deviceKeyHash,createdAt:now,updatedAt:now});
   }
   const locked=await t.getEntity<Identity>(PK,serial);
   await t.updateEntity({partitionKey:PK,rowKey:serial,issuanceUntil:''},'Merge',{etag:locked.etag});

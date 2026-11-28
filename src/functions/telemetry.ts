@@ -1,7 +1,7 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { TableClient } from '@azure/data-tables';
-import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
-import { errorStatus, validCustomerId } from '../access';
+import { randomUUID } from 'node:crypto';
+import { authenticateDevice } from '../devices/authentication';
 
 const SERIAL = /^[A-Za-z0-9._-]{1,100}$/;
 const TABLE = 'SentinelDeviceTelemetry';
@@ -23,19 +23,17 @@ const fail = (status: number, error: string): HttpResponseInit => ({status, json
 
 async function ingest(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   try {
-    const serial = (request.params.serialNumber ?? '').toUpperCase();
-    if (!SERIAL.test(serial)) return fail(400, 'Invalid device serial number');
-    const key = request.headers.get('x-sentinel-device-key') ?? '';
-    if (!key || key.length > 200) return fail(401, 'Device credential required');
-    const connection = process.env.SENTINEL_STORAGE_CONNECTION;
-    if (!connection) throw new Error('Storage not configured');
-    const devices = TableClient.fromConnectionString(connection, 'SentinelDevices');
-    let device;
-    try { device = await devices.getEntity<{deviceId: string; status: string; customerId: string; deviceKeyHash?: string}>('DEVICE', serial); }
-    catch (e) { if (errorStatus(e) === 404) return fail(401, 'Invalid device credential'); throw e; }
-    const saved = device.deviceKeyHash ?? '';
-    if (!/^[0-9a-f]{64}$/.test(saved) || !timingSafeEqual(Buffer.from(saved, 'hex'), createHash('sha256').update(key).digest())) return fail(401, 'Invalid device credential');
-    if (!(device.status === 'Inventory' && !device.customerId) && !(device.status === 'Assigned' && validCustomerId(device.customerId))) return fail(403, 'Device lifecycle status does not permit telemetry');
+        const auth = await authenticateDevice(request);
+
+    if (auth.status !== 200) {
+      return fail(auth.status, auth.error);
+    }
+
+    const {
+      connection,
+      device,
+      serialNumber: serial
+    } = auth;
     let body: Record<string, unknown>;
     try {
       const raw = await request.text();

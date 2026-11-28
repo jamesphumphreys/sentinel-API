@@ -23,6 +23,7 @@ type Device = {
   provisioningStatus?: string; allocationStatus?: string; deploymentStatus?: string;
   lifecycleStatus?: string; manifestJson?: string; fingerprint?: string; isSimulated?: boolean;
   gpsEnabled?: boolean;
+  deploymentRevision?: number;
   createdAt: string; updatedAt: string;
 };
 type Body = { serialNumber?: unknown; deviceType?: unknown; displayName?: unknown;
@@ -43,6 +44,7 @@ function present(entity: Device & { etag?: string }) {
     provisioningStatus: entity.provisioningStatus ?? null,
     allocationStatus: entity.customerId ? 'Allocated' : 'Inventory',
     deploymentStatus,
+    deploymentRevision: entity.deploymentRevision ?? 0,
     lifecycleStatus: entity.status === 'Retired' ? 'Retired' : 'Active',
     isSimulated: entity.isSimulated ?? null,
     protocolVersion: manifest?.protocolVersion ?? null,
@@ -173,6 +175,22 @@ async function updateDevice(request: HttpRequest, context: InvocationContext): P
     const customerChanged = existing.customerId !== customerId;
     if ((customerChanged || body.status === 'Retired') && (existing.currentDeploymentId || (existing.deploymentState && existing.deploymentState !== 'Awaiting')))
       return { status: 409, jsonBody: { error: 'Clear the existing deployment before changing allocation or retiring' } };
+    // Invalidate commands when the allocation, lifecycle or location context changes.
+    const revision = existing.deploymentRevision ?? 0;
+    if (!Number.isSafeInteger(revision) || revision < 0)
+      return { status: 409, jsonBody: { error: 'Invalid stored deployment revision' } };
+
+    const locationChanged =
+      (existing.locationMode === 'Manual' ? 'Manual' : 'GPS') !== body.locationMode ||
+      (body.locationMode === 'Manual' && (
+        existing.manualLatitude !== body.manualLatitude ||
+        existing.manualLongitude !== body.manualLongitude
+      ));
+    const contextChanged = customerChanged || existing.status !== body.status || locationChanged;
+    const deploymentRevision = revision + (contextChanged ? 1 : 0);
+    if (!Number.isSafeInteger(deploymentRevision))
+      return { status: 409, jsonBody: { error: 'Deployment revision limit reached' } };
+
     // Preserve all stored identity, credential, configuration and diagnostic fields.
     // Strip SDK metadata before sending the replacement entity.
     const { etag: ignoredEtag, timestamp: ignoredTimestamp, ...stored } = existing as typeof existing & { timestamp?: unknown };
@@ -184,6 +202,7 @@ async function updateDevice(request: HttpRequest, context: InvocationContext): P
       lifecycleStatus: body.status === 'Retired' ? 'Retired' : 'Active',
       deploymentStatus: existing.deploymentState === 'Monitoring' ? 'Deployed' : 'Undeployed',
       locationMode: body.locationMode as string,
+      deploymentRevision,
       updatedAt: new Date().toISOString()
     } as Device & { partitionKey: string; rowKey: string; [key: string]: any };
     delete updated.farmId;

@@ -3,6 +3,9 @@ import { TableClient } from '@azure/data-tables';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { requireAccess, canAccessCustomer, forbidden, errorStatus, normaliseAUPhone, validCustomerId, readUserAccess } from '../access';
 import { sendSimulationPush } from './push';
+import { authenticateDevice } from '../devices/authentication';
+import { processManagementCheckin, ManagementError } from '../devices/management';
+import { ProtocolValidationError } from '../protocol/validation';
 
 const SERIAL = /^[A-Za-z0-9._-]{1,100}$/;
 const ID = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -28,7 +31,7 @@ type Deployment = { customerId:string; serialNumber:string; status:string; farmI
   configVersion?:number; configJson?:string; currentAlertId?:string; ackCommandId?:string; ackPhone?:string; ackAt?:string; };
 type DeviceEvent = {eventId:string;type:string;at?:string; relatedEventId?:string;recipient?:string;modemResult?:string;sender?:string;commandId?:string};
 
-type PowerCommand = {partitionKey:string;rowKey:string;customerId:string;type:string;status:string;
+type PowerCommand = {partitionKey:string;rowKey:string;protocolVersion?:number;customerId:string;type:string;status:string;
   requestedAt:string;expiresAt:string;deliveredAt?:string;appliedAt?:string;confirmedAt?:string};
 
 // Commands are queued by the portal and delivered during authenticated device check-in.
@@ -37,7 +40,7 @@ async function pendingPowerCommands(connection:string, serial:string, customerId
   try {
     const result:{commandId:string;type:string}[]=[];
     for await(const cmd of commands.listEntities<PowerCommand>({queryOptions:{filter:`PartitionKey eq '${serial}'`}})) {
-      if(cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))continue;
+      if(cmd.protocolVersion!==undefined || cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))continue;
       if(cmd.status!=='Queued' && cmd.status!=='Delivered')continue;
       if(Date.parse(cmd.expiresAt)<=Date.now()) {
         try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Expired'},'Merge',{etag:cmd.etag});}
@@ -60,7 +63,7 @@ async function applyPowerCommandEvent(connection:string, serial:string, customer
   let cmd:PowerCommand & {etag?:string};
   try {cmd=await commands.getEntity<PowerCommand>(serial,ev.commandId);}
   catch(e){if(errorStatus(e)===404)return;throw e;}
-  if(cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))return;
+  if(cmd.protocolVersion!==undefined || cmd.customerId!==customerId || !['DEVICE_RESTART','DEVICE_SHUTDOWN'].includes(cmd.type))return;
   if(ev.type==='COMMAND_APPLIED' && cmd.status==='Delivered') {
     try {await commands.updateEntity({partitionKey:serial,rowKey:cmd.rowKey,status:'Applied',appliedAt:now()},'Merge',{etag:cmd.etag});}
     catch(e){if(errorStatus(e)!==412)throw e;}
@@ -121,6 +124,7 @@ async function credential(request:HttpRequest,context:InvocationContext):Promise
     const devices=table(a.connection,TABLES.devices);
     let device;
     try {device=await devices.getEntity<Device>('DEVICE',serial);} catch(e){if(errorStatus(e)===404)return fail(404,'Device not found');throw e;}
+    if(serial!=='0000001')return fail(409,'Use Protocol v1 credential management for this device');
     if(device.status==='Retired')return fail(409,'Retired devices cannot be provisioned');
     try { await table(a.connection,'SentinelDeviceProvisioning').getEntity('DEVICE',serial); return fail(409,'Use OTA credential management for this device'); } catch(e) { if(errorStatus(e)!==404)throw e; }
     const secret=randomBytes(32).toString('base64url');
@@ -131,18 +135,64 @@ async function credential(request:HttpRequest,context:InvocationContext):Promise
 
 async function deviceCheckin(request:HttpRequest,context:InvocationContext):Promise<HttpResponseInit> {
   try {
-    const serial=(request.params.serialNumber??'').toUpperCase();
-    if(!SERIAL.test(serial))return fail(400,'Invalid device serial number');
-    const provided=request.headers.get('x-sentinel-device-key')??'';
-    if(!provided || provided.length>200)return fail(401,'Device credential required');
-    const c=storage(),devices=table(c,TABLES.devices);
-    let device;
-    try {device=await devices.getEntity<Device>('DEVICE',serial);}catch(e){if(errorStatus(e)===404)return fail(401,'Unknown device');throw e;}
-    const saved=device.deviceKeyHash ?? '';
-    if(!/^[0-9a-f]{64}$/.test(saved) || !timingSafeEqual(Buffer.from(saved,'hex'),Buffer.from(sha(provided),'hex')))return fail(401,'Invalid device credential');
-    if(device.status!=='Assigned' || !validCustomerId(device.customerId))return fail(403,'Device is not assigned');
-    if(device.deviceType!=='BayMonitor')return fail(403,'This endpoint is for BayMonitors');
-    const body=await request.json() as Record<string,unknown>;
+    const auth = await authenticateDevice(request);
+
+    if (auth.status !== 200) {
+      return fail(auth.status, auth.error);
+    }
+
+    if (!auth.legacy) {
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return fail(400, 'Invalid JSON');
+      }
+
+      try {
+        const response = await processManagementCheckin(auth, body);
+        return {
+          status: 200,
+          headers: { 'Cache-Control': 'no-store' },
+          jsonBody: response
+        };
+      } catch (error) {
+        if (error instanceof ProtocolValidationError) {
+          return fail(400, error.message);
+        }
+        if (error instanceof ManagementError) {
+          return fail(error.status, error.message);
+        }
+        throw error;
+      }
+    }
+
+    const {
+      connection: c,
+      serialNumber: serial
+    } = auth;
+
+    const devices = table(c, TABLES.devices);
+
+    const device = await devices.getEntity<Device>(
+      'DEVICE',
+      serial
+    );
+
+    if (device.etag !== auth.device.etag)
+      return fail(409, 'Device changed; retry check-in');
+
+    if (device.status !== 'Assigned' || !validCustomerId(device.customerId))
+      return fail(403, 'Device is not assigned');
+
+    if (device.deviceType !== 'BayMonitor')
+      return fail(403, 'This endpoint is for BayMonitors');
+    let body: Record<string, unknown>;
+    try {
+      body = await request.json() as Record<string, unknown>;
+    } catch {
+      return fail(400, 'Invalid JSON');
+    }
     if(!body || typeof body!=='object' || Array.isArray(body))return fail(400,'Invalid check-in');
     const latitude=body.latitude,longitude=body.longitude;
     if((latitude!==undefined||longitude!==undefined) && (!isNumber(latitude,90)||!isNumber(longitude,180)))return fail(400,'Invalid GPS coordinates');

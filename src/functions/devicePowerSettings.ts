@@ -1,49 +1,304 @@
-import { app, type HttpRequest, type HttpResponseInit, type InvocationContext } from '@azure/functions';
+import {
+  app,
+  type HttpRequest,
+  type HttpResponseInit,
+  type InvocationContext
+} from '@azure/functions';
+
 import { TableClient } from '@azure/data-tables';
-import { requireAccess, forbidden } from '../access';
+
+import {
+  requireAccess,
+  forbidden,
+  canAccessCustomer,
+  errorStatus
+} from '../access';
+
+import {
+  readDeviceConfiguration,
+  validateConfigurationPatch,
+  type ConfigurationEntity
+} from '../devices/configuration';
+
+import {
+  validateDeviceManifest
+} from '../protocol/validation';
 
 const SERIAL = /^[A-Za-z0-9._-]{1,100}$/;
-const response = (status:number,error:string):HttpResponseInit => ({status,jsonBody:{error}});
+const HARDWARE_SERIAL = /^[0-9A-F]{12}$/;
 
-async function powerSettingsUpdate(request:HttpRequest, context:InvocationContext):Promise<HttpResponseInit> {
+type Device = ConfigurationEntity & {
+  status: string;
+  customerId: string;
+  deviceType: string;
+  provisioningStatus?: string;
+  lifecycleStatus?: string;
+  manifestJson?: string;
+};
+
+const response = (
+  status: number,
+  error: string
+): HttpResponseInit => ({
+  status,
+  headers: { 'Cache-Control': 'no-store' },
+  jsonBody: { error }
+});
+
+async function powerSettingsUpdate(
+  request: HttpRequest,
+  context: InvocationContext
+): Promise<HttpResponseInit> {
   try {
-    const access=await requireAccess(request);
-    if(access.status!==200)return forbidden(access.status);
-    if(!access.permissions.canManageDevices)return forbidden(403);
-    const serial=(request.params.serialNumber??'').toUpperCase();
-    if(!SERIAL.test(serial))return response(400,'Invalid serial number');
-    const table=TableClient.fromConnectionString(access.connection,'SentinelDevices');
+    const access = await requireAccess(request);
+
+    if (access.status !== 200)
+      return forbidden(access.status);
+
+    if (!access.permissions.canManageDevices)
+      return forbidden(403);
+
+    const serial = (
+      request.params.serialNumber ?? ''
+    ).toUpperCase();
+
+    if (!SERIAL.test(serial))
+      return response(400, 'Invalid serial number');
+
+    const table = TableClient.fromConnectionString(
+      access.connection,
+      'SentinelDevices'
+    );
+
     let device;
-    try {device=await table.getEntity<{status:string;customerId:string;deviceType:string;desiredPowerState?:string;telemetryIntervalSeconds?:number;powerOffCheckIntervalSeconds?:number}>('DEVICE',serial);}
-    catch(e) {if((e as {statusCode?:number}).statusCode===404)return response(404,'Device not found');throw e;}
-    if(device.status!=='Assigned'||!device.customerId||device.deviceType!=='BayMonitor')return response(409,'Device must be an assigned BayMonitor');
-    let body:Record<string,unknown>;
-    try {body=await request.json() as Record<string,unknown>;}catch{return response(400,'Invalid JSON');}
-    if(!body||typeof body!=='object'||Array.isArray(body))return response(400,'Invalid settings');
-    const state=body.desiredPowerState;
-    const telemetry=body.telemetryIntervalSeconds;
-    const sleeping=body.powerOffCheckIntervalSeconds;
-    if(state!==undefined&&state!=='ON'&&state!=='OFF')return response(400,'desiredPowerState must be ON or OFF');
-    if(telemetry!==undefined&&(!Number.isInteger(telemetry)|| (telemetry as number)<15||(telemetry as number)>86400))return response(400,'telemetryIntervalSeconds must be 15–86400');
-    if(sleeping!==undefined&&(!Number.isInteger(sleeping)||(sleeping as number)<60||(sleeping as number)>86400))return response(400,'powerOffCheckIntervalSeconds must be 60–86400');
-    if(state===undefined&&telemetry===undefined&&sleeping===undefined)return response(400,'No settings supplied');
-    if(state==='OFF'&&!access.permissions.canShutdownDevices)return forbidden(403);
-    const update:{partitionKey:string;rowKey:string;desiredPowerState?:string;telemetryIntervalSeconds?:number;powerOffCheckIntervalSeconds?:number;updatedAt:string}={partitionKey:'DEVICE',rowKey:serial,updatedAt:new Date().toISOString()};
-    if(state!==undefined)update.desiredPowerState=state as string;
-    if(telemetry!==undefined)update.telemetryIntervalSeconds=telemetry as number;
-    if(sleeping!==undefined)update.powerOffCheckIntervalSeconds=sleeping as number;
-    const etag=request.headers.get('if-match');
-    if(!etag||etag==='*')return response(428,'Supply device ETag in If-Match');
-    if(etag!==device.etag)return response(412,'Device changed; reload first');
-    try {await table.updateEntity(update,'Merge',{etag});}
-    catch(e){if((e as {statusCode?:number}).statusCode===412)return response(412,'Device changed; reload first');throw e;}
-    const saved=await table.getEntity<typeof device>('DEVICE',serial);
-    return {status:200,headers:{'Cache-Control':'no-store'},jsonBody:{
-      desiredPowerState:saved.desiredPowerState==='OFF'?'OFF':'ON',
-      telemetryIntervalSeconds:saved.telemetryIntervalSeconds??30,
-      powerOffCheckIntervalSeconds:saved.powerOffCheckIntervalSeconds??300,
-      etag:saved.etag
-    }};
-  }catch(e){context.error('Unable to update device power settings',e);return response(500,'Unable to update power settings');}
+
+    try {
+      device = await table.getEntity<Device>(
+        'DEVICE',
+        serial
+      );
+    } catch (error) {
+      if (errorStatus(error) === 404)
+        return response(404, 'Device not found');
+
+      throw error;
+    }
+
+    // Inventory devices are manageable by administrators only.
+    if (!access.isAdmin) {
+      if (
+        !device.customerId ||
+        !canAccessCustomer(access, device.customerId)
+      ) {
+        return forbidden(403);
+      }
+    }
+
+    if (
+      device.lifecycleStatus === 'Retired' ||
+      !['Inventory', 'Assigned'].includes(device.status)
+    ) {
+      return response(409, 'Device is not active');
+    }
+
+    // Temporary compatibility for the existing physical device.
+    const legacy =
+      serial === '0000001' &&
+      !device.manifestJson &&
+      device.provisioningStatus === undefined;
+
+    let supportsGps = false;
+
+    if (legacy) {
+
+      supportsGps = device.deviceType === 'BayMonitor';
+
+    } else {
+
+      if (!HARDWARE_SERIAL.test(serial))
+        return response(409, 'Invalid hardware identity');
+
+      if (device.provisioningStatus !== 'Confirmed')
+        return response(
+          409,
+          'Device provisioning is not confirmed'
+        );
+
+      if (device.lifecycleStatus !== 'Active')
+        return response(409, 'Device is not active');
+
+      // Capabilities are defined by the provisioned manifest.
+      try {
+        const manifest = validateDeviceManifest(
+          JSON.parse(device.manifestJson ?? '')
+        );
+
+        if (manifest.deviceType !== device.deviceType)
+          return response(
+            409,
+            'Device manifest does not match registry'
+          );
+
+        supportsGps =
+          manifest.capabilities.features.includes('gps');
+
+      } catch {
+        return response(409, 'Invalid device manifest');
+      }
+    }
+
+    let body: Record<string, unknown>;
+
+    try {
+      body = await request.json() as Record<string, unknown>;
+    } catch {
+      return response(400, 'Invalid JSON');
+    }
+
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      Array.isArray(body)
+    ) {
+      return response(400, 'Invalid settings');
+    }
+
+    const validation = validateConfigurationPatch(
+      body,
+      supportsGps
+    );
+
+    if (validation)
+      return response(400, validation);
+
+    if (
+      body.desiredPowerState === 'OFF' &&
+      !access.permissions.canShutdownDevices
+    ) {
+      return forbidden(403);
+    }
+
+    const etag = request.headers.get('if-match');
+
+    if (!etag || etag === '*')
+      return response(428, 'Supply device ETag in If-Match');
+
+    if (etag !== device.etag)
+      return response(412, 'Device changed; reload first');
+
+    const current = readDeviceConfiguration(
+      device,
+      supportsGps
+    );
+
+    const update: ConfigurationEntity & {
+      partitionKey: string;
+      rowKey: string;
+      updatedAt: string;
+    } = {
+      partitionKey: 'DEVICE',
+      rowKey: serial,
+      updatedAt: new Date().toISOString()
+    };
+
+    let changed = false;
+
+    if (
+      body.desiredPowerState !== undefined &&
+      body.desiredPowerState !== current.desiredPowerState
+    ) {
+      update.desiredPowerState =
+        body.desiredPowerState as string;
+
+      changed = true;
+    }
+
+    if (
+      body.telemetryIntervalSeconds !== undefined &&
+      body.telemetryIntervalSeconds !== current.telemetryIntervalSeconds
+    ) {
+      update.telemetryIntervalSeconds =
+        body.telemetryIntervalSeconds as number;
+
+      changed = true;
+    }
+
+    if (
+      body.powerOffCheckIntervalSeconds !== undefined &&
+      body.powerOffCheckIntervalSeconds !== current.powerOffCheckIntervalSeconds
+    ) {
+      update.powerOffCheckIntervalSeconds =
+        body.powerOffCheckIntervalSeconds as number;
+
+      changed = true;
+    }
+
+    if (
+      body.gpsEnabled !== undefined &&
+      body.gpsEnabled !== current.gpsEnabled
+    ) {
+      update.gpsEnabled = body.gpsEnabled as boolean;
+
+      changed = true;
+    }
+
+    // Do not increment the revision for an unchanged configuration.
+    if (!changed) {
+      return {
+        status: 200,
+        headers: { 'Cache-Control': 'no-store' },
+        jsonBody: {
+          ...current,
+          etag: device.etag
+        }
+      };
+    }
+
+    update.configurationRevision = current.revision + 1;
+
+    try {
+      await table.updateEntity(
+        update,
+        'Merge',
+        { etag }
+      );
+    } catch (error) {
+      if (errorStatus(error) === 412)
+        return response(412, 'Device changed; reload first');
+
+      if (errorStatus(error) === 404)
+        return response(404, 'Device no longer exists');
+
+      throw error;
+    }
+
+    const saved = await table.getEntity<Device>(
+      'DEVICE',
+      serial
+    );
+
+    return {
+      status: 200,
+      headers: { 'Cache-Control': 'no-store' },
+      jsonBody: {
+        ...readDeviceConfiguration(saved, supportsGps),
+        etag: saved.etag
+      }
+    };
+
+  } catch (error) {
+    context.error(
+      'Unable to update device power settings',
+      error
+    );
+
+    return response(500, 'Unable to update power settings');
+  }
 }
-app.http('devicePowerSettingsUpdate',{methods:['PATCH'],authLevel:'anonymous',route:'devices/{serialNumber}/power-settings',handler:powerSettingsUpdate});
+
+app.http('devicePowerSettingsUpdate', {
+  methods: ['PATCH'],
+  authLevel: 'anonymous',
+  route: 'devices/{serialNumber}/power-settings',
+  handler: powerSettingsUpdate
+});
