@@ -62,3 +62,16 @@ AzuriteConfig
 
 # Logs
 *.log
+# Additional Sentinel exclusions
+.env.*
+!.env.example
+*.local
+coverage/
+*.tsbuildinfo
+*.tmp
+*.bak
+*.orig
+Thumbs.db
+.DS_Store
+.idea/
+.swa/
