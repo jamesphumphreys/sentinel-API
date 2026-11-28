@@ -1,12 +1,12 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { TableClient } from '@azure/data-tables';
-import { randomUUID } from 'node:crypto';
+import { validateDeviceManifest } from '../protocol/validation';
 import { requireAccess, forbidden } from '../access';
 
 const TABLE = 'SentinelDevices';
 const SERIAL = /^[A-Za-z0-9._-]{1,100}$/;
 const CUSTOMER = /^[A-Za-z0-9-]{1,64}$/;
-const TYPES = ['BayMonitor', 'PumpMonitor'] as const;
+const TYPES = ['BayMonitor', 'PumpMonitor', 'DamMonitor', 'FenceMonitor'] as const;
 const HARDWARE_FIELDS = ['imei', 'simIccid', 'simCarrier', 'simPhoneNumber', 'modemModel', 'firmwareVersion'] as const;
 const STATUSES = ['Inventory', 'Assigned', 'Suspended', 'Retired'] as const;
 type DeviceType = typeof TYPES[number];
@@ -20,10 +20,13 @@ type Device = {
   activeFarmId?: string; activeBayId?: string; batteryPercent?: number; lastWaterState?: boolean;
   imei?: string; simIccid?: string; simCarrier?: string; simPhoneNumber?: string; modemModel?: string; firmwareVersion?: string;
   desiredPowerState?: string; telemetryIntervalSeconds?: number; powerOffCheckIntervalSeconds?: number;
+  provisioningStatus?: string; allocationStatus?: string; deploymentStatus?: string;
+  lifecycleStatus?: string; manifestJson?: string; fingerprint?: string; isSimulated?: boolean;
+  gpsEnabled?: boolean;
   createdAt: string; updatedAt: string;
 };
 type Body = { serialNumber?: unknown; deviceType?: unknown; displayName?: unknown;
-  status?: unknown; customerId?: unknown; locationMode?: unknown;
+  allocationStatus?: unknown; lifecycleStatus?: unknown; status?: unknown; customerId?: unknown; locationMode?: unknown;
   manualLatitude?: unknown; manualLongitude?: unknown;
   imei?: unknown; simIccid?: unknown; simCarrier?: unknown; simPhoneNumber?: unknown; modemModel?: unknown; firmwareVersion?: unknown };
 const errorStatus = (error: unknown) => (error as { statusCode?: number }).statusCode;
@@ -33,7 +36,20 @@ const validCoordinate = (value: unknown, limit: number): value is number =>
   typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= limit;
 
 function present(entity: Device & { etag?: string }) {
+  const manifest = entity.manifestJson ? validateDeviceManifest(JSON.parse(entity.manifestJson)) : null;
+  // Deployment handlers still own the legacy deployment state until migrated.
+  const deploymentStatus = entity.deploymentState === 'Monitoring' ? 'Deployed' : 'Undeployed';
   return {
+    provisioningStatus: entity.provisioningStatus ?? null,
+    allocationStatus: entity.customerId ? 'Allocated' : 'Inventory',
+    deploymentStatus,
+    lifecycleStatus: entity.status === 'Retired' ? 'Retired' : 'Active',
+    isSimulated: entity.isSimulated ?? null,
+    protocolVersion: manifest?.protocolVersion ?? null,
+    hardwareModel: manifest?.hardwareModel ?? null,
+    hardwareRevision: manifest?.hardwareRevision ?? null,
+    capabilities: manifest?.capabilities ?? null,
+    fingerprint: entity.fingerprint ?? null,
     id: entity.deviceId, serialNumber: entity.serialNumber, deviceType: entity.deviceType,
     displayName: entity.displayName, status: entity.status, customerId: entity.customerId || null,
     locationMode: entity.locationMode === 'Manual' ? 'Manual' : 'GPS',
@@ -43,7 +59,7 @@ function present(entity: Device & { etag?: string }) {
     activeLatitude: typeof entity.activeLatitude === 'number' ? entity.activeLatitude : null,
     activeLongitude: typeof entity.activeLongitude === 'number' ? entity.activeLongitude : null,
     ...Object.fromEntries(HARDWARE_FIELDS.map(field => [field, entity[field] || null])),
-    powerSettings: {desiredPowerState: entity.desiredPowerState === "OFF" ? "OFF" : "ON", telemetryIntervalSeconds: entity.telemetryIntervalSeconds ?? 30, powerOffCheckIntervalSeconds: entity.powerOffCheckIntervalSeconds ?? 300},
+    powerSettings: {desiredPowerState: entity.desiredPowerState === "OFF" ? "OFF" : "ON", telemetryIntervalSeconds: entity.telemetryIntervalSeconds ?? 30, powerOffCheckIntervalSeconds: entity.powerOffCheckIntervalSeconds ?? 300, gpsEnabled: entity.gpsEnabled ?? null},
     createdAt: entity.createdAt, updatedAt: entity.updatedAt, etag: entity.etag
   };
 }
@@ -94,11 +110,11 @@ async function listDevices(request: HttpRequest, context: InvocationContext): Pr
     if (access.status !== 200) return { status: access.status, jsonBody: { error: 'Access denied' } };
     const table = TableClient.fromConnectionString(access.connection, TABLE);
     const devices = [];
-    for await (const entity of table.listEntities<Device>()) {
-      if (!access.isAdmin && entity.customerId !== access.user.customerId) continue;
+    for await (const entity of table.listEntities<Device>({queryOptions: {filter: "PartitionKey eq 'DEVICE'"}})) {
+      if (!access.isAdmin && (entity.customerId !== access.user.customerId || entity.status === 'Retired' || (entity.provisioningStatus && entity.provisioningStatus !== 'Confirmed'))) continue;
       const value = present(entity);
       if (!access.isAdmin) {
-        for (const field of HARDWARE_FIELDS) delete (value as Record<string,unknown>)[field];
+        for (const field of [...HARDWARE_FIELDS, 'fingerprint']) delete (value as Record<string,unknown>)[field];
       }
       devices.push(value);
     }
@@ -111,45 +127,17 @@ async function listDevices(request: HttpRequest, context: InvocationContext): Pr
 }
 
 async function createDevice(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
-  try {
-    const access = await requireAccess(request);
-    if (access.status !== 200) return { status: access.status, jsonBody: { error: 'Access denied' } };
-    if (!access.isAdmin) return forbidden(403);
-    let body: Body;
-    try { body = await request.json() as Body; } catch { return { status: 400, jsonBody: { error: 'Invalid JSON' } }; }
-    const validation = validateBody(body, true);
-    if (validation) return { status: 400, jsonBody: { error: validation } };
-    const customerId = body.customerId as string;
-    const customerError = await checkCustomer(access.connection, customerId);
-    if (customerError) return { status: 400, jsonBody: { error: customerError } };
-    const serial = (body.serialNumber as string).trim().toUpperCase();
-    const now = new Date().toISOString();
-    const table = TableClient.fromConnectionString(access.connection, TABLE);
-    try {
-      await table.createEntity({ partitionKey: 'DEVICE', rowKey: serial, deviceId: randomUUID(),
-        serialNumber: serial, deviceType: body.deviceType as DeviceType,
-        displayName: (body.displayName as string).trim(), status: customerId ? 'Assigned' : 'Inventory',
-        customerId, locationMode: body.locationMode as string,
-        ...(body.locationMode === 'Manual' ? { manualLatitude: body.manualLatitude as number, manualLongitude: body.manualLongitude as number } : {}),
-        ...Object.fromEntries(HARDWARE_FIELDS.filter(field => typeof body[field] === 'string' && body[field]).map(field => [field, (body[field] as string).trim()])),
-        deploymentState: 'Awaiting', createdAt: now, updatedAt: now });
-    } catch (error) {
-      if (errorStatus(error) === 409) return { status: 409, jsonBody: { error: 'Serial number already registered' } };
-      throw error;
-    }
-    const saved = await table.getEntity<Device>('DEVICE', serial);
-    return { status: 201, jsonBody: present(saved) };
-  } catch (error) {
-    context.error('Unable to register device', error);
-    return { status: 500, jsonBody: { error: 'Unable to register device' } };
-  }
+  const access = await requireAccess(request);
+  if (access.status !== 200) return forbidden(access.status);
+  if (!access.isAdmin || !access.permissions.canManageDevices) return forbidden(403);
+  return { status: 409, jsonBody: { error: 'Register new devices through cryptographic provisioning' } };
 }
 
 async function updateDevice(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   try {
     const access = await requireAccess(request);
     if (access.status !== 200) return { status: access.status, jsonBody: { error: 'Access denied' } };
-    if (!access.isAdmin) return forbidden(403);
+    if (!access.isAdmin || !access.permissions.canManageDevices) return forbidden(403);
     const serial = (request.params.serialNumber || '').toUpperCase();
     if (!SERIAL.test(serial)) return { status: 400, jsonBody: { error: 'Invalid serial number' } };
     const table = TableClient.fromConnectionString(access.connection, TABLE);
@@ -162,38 +150,64 @@ async function updateDevice(request: HttpRequest, context: InvocationContext): P
     if (existing.status === 'Retired') return { status: 409, jsonBody: { error: 'Retired devices cannot be modified' } };
     let body: Body;
     try { body = await request.json() as Body; } catch { return { status: 400, jsonBody: { error: 'Invalid JSON' } }; }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return { status: 400, jsonBody: { error: 'Expected JSON object' } };
+    // Accept canonical allocation/lifecycle fields and temporarily retain the old UI contract.
+    if (body.allocationStatus !== undefined || body.lifecycleStatus !== undefined) {
+      if (!['Inventory','Allocated'].includes(body.allocationStatus as string) || !['Active','Retired'].includes(body.lifecycleStatus as string))
+        return { status: 400, jsonBody: { error: 'Invalid allocation or lifecycle status' } };
+      if ((body.allocationStatus === 'Allocated') !== Boolean(body.customerId) || (body.lifecycleStatus === 'Retired' && body.customerId))
+        return { status: 400, jsonBody: { error: 'Invalid allocation for customer or lifecycle' } };
+      const status = body.lifecycleStatus === 'Retired' ? 'Retired' : body.allocationStatus === 'Allocated' ? 'Assigned' : 'Inventory';
+      if (body.status !== undefined && body.status !== status) return { status: 400, jsonBody: { error: 'Conflicting status fields' } };
+      body.status = status;
+    }
     const validation = validateBody(body, false);
     if (validation) return { status: 400, jsonBody: { error: validation } };
     const customerId = body.customerId as string;
     const customerError = await checkCustomer(access.connection, customerId);
     if (customerError) return { status: 400, jsonBody: { error: customerError } };
-    // Existing records may contain farmId/bayId from the first prototype. Clear these legacy assignments.
-    // Replace is deliberate: preserve immutable identity and deployment fields, omit legacy assignment fields.
-    const updated: Device & { partitionKey: string; rowKey: string } = {
-      partitionKey: 'DEVICE', rowKey: serial, deviceId: existing.deviceId,
-      serialNumber: existing.serialNumber, deviceType: existing.deviceType,
+    if (existing.provisioningStatus && existing.provisioningStatus !== 'Confirmed' && customerId)
+      return { status: 409, jsonBody: { error: 'Confirm provisioning before allocation' } };
+    if (body.status === 'Retired' && customerId)
+      return { status: 400, jsonBody: { error: 'Retired devices must be unallocated' } };
+    const customerChanged = existing.customerId !== customerId;
+    if ((customerChanged || body.status === 'Retired') && (existing.currentDeploymentId || (existing.deploymentState && existing.deploymentState !== 'Awaiting')))
+      return { status: 409, jsonBody: { error: 'Clear the existing deployment before changing allocation or retiring' } };
+    // Preserve all stored identity, credential, configuration and diagnostic fields.
+    // Strip SDK metadata before sending the replacement entity.
+    const { etag: ignoredEtag, timestamp: ignoredTimestamp, ...stored } = existing as typeof existing & { timestamp?: unknown };
+    const updated = {
+      ...stored,
+      partitionKey: 'DEVICE', rowKey: serial,
       displayName: (body.displayName as string).trim(), status: body.status as Status, customerId,
+      allocationStatus: customerId ? 'Allocated' : 'Inventory',
+      lifecycleStatus: body.status === 'Retired' ? 'Retired' : 'Active',
+      deploymentStatus: existing.deploymentState === 'Monitoring' ? 'Deployed' : 'Undeployed',
       locationMode: body.locationMode as string,
-      ...(body.locationMode === 'Manual' ? { manualLatitude: body.manualLatitude as number, manualLongitude: body.manualLongitude as number } : {}),
-      ...Object.fromEntries(HARDWARE_FIELDS.filter(field => typeof body[field] === 'string' && body[field]).map(field => [field, (body[field] as string).trim()])),
-      deploymentState: existing.customerId === customerId ? (existing.deploymentState || 'Awaiting') : 'Awaiting',
-      ...(existing.customerId === customerId ? {
-        ...(existing.deviceKeyHash ? {deviceKeyHash:existing.deviceKeyHash}:{}),
-        ...(existing.desiredPowerState ? {desiredPowerState:existing.desiredPowerState}:{}),
-        ...(typeof existing.telemetryIntervalSeconds === "number" ? {telemetryIntervalSeconds:existing.telemetryIntervalSeconds}:{}),
-        ...(typeof existing.powerOffCheckIntervalSeconds === "number" ? {powerOffCheckIntervalSeconds:existing.powerOffCheckIntervalSeconds}:{}),
-        ...(existing.currentDeploymentId ? {currentDeploymentId:existing.currentDeploymentId}:{}),
-        ...(existing.lastGoId ? {lastGoId:existing.lastGoId}:{}),
-        ...(existing.lastSeenAt ? {lastSeenAt:existing.lastSeenAt}:{}),
-        ...(existing.activeFarmId ? {activeFarmId:existing.activeFarmId}:{}),
-        ...(existing.activeBayId ? {activeBayId:existing.activeBayId}:{}),
-        ...(typeof existing.batteryPercent==='number' ? {batteryPercent:existing.batteryPercent}:{}),
-        ...(typeof existing.lastWaterState==='boolean' ? {lastWaterState:existing.lastWaterState}:{}),
-      } : {}),
-      ...(existing.customerId === customerId && typeof existing.activeLatitude === 'number' && typeof existing.activeLongitude === 'number' ?
-        { activeLatitude: existing.activeLatitude, activeLongitude: existing.activeLongitude } : {}),
-      createdAt: existing.createdAt, updatedAt: new Date().toISOString()
-    };
+      updatedAt: new Date().toISOString()
+    } as Device & { partitionKey: string; rowKey: string; [key: string]: any };
+    delete updated.farmId;
+    delete updated.bayId;
+    if (body.locationMode === 'Manual') {
+      updated.manualLatitude = body.manualLatitude as number;
+      updated.manualLongitude = body.manualLongitude as number;
+    } else {
+      delete updated.manualLatitude;
+      delete updated.manualLongitude;
+    }
+    for (const field of HARDWARE_FIELDS) {
+      if (field === 'firmwareVersion' && existing.manifestJson) continue;
+      if (typeof body[field] === 'string') {
+        const value = (body[field] as string).trim();
+        if (value) updated[field] = value;
+        else delete updated[field];
+      }
+    }
+    if (customerChanged) {
+      for (const field of ['currentDeploymentId','lastGoId','activeFarmId','activeBayId','activeLatitude','activeLongitude','lastWaterState','lastSeenAt','batteryPercent']) delete updated[field];
+      updated.deploymentState = 'Awaiting';
+      updated.deploymentStatus = 'Undeployed';
+    }
     try { await table.updateEntity(updated, 'Replace', { etag }); }
     catch (error) {
       if (errorStatus(error) === 412) return { status: 412, jsonBody: { error: 'Device changed elsewhere; reload first' } };
